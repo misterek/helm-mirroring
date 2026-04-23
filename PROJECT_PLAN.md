@@ -56,7 +56,8 @@ The goal is to **eliminate the default footgun**: a consumer who `helm install`s
 
 - From an empty repo, a developer can: add a chart (**single-chart, no subchart deps** in v1) to config → next detector run → PR with scan results → merge → vendored chart appears under `vendored/<chart>/<version>/` with a rewritten `values.yaml` pointing at zot in local testing.
 - Same flow in production pushes to ECR with images pinned by digest and signed by our cosign key.
-- Upstream silently rolls a tag → next detector run opens a new PR for the new digest. Old digest stays mirrored, referenced by the older vendored chart version.
+- When upstream publishes a **new chart version**, the detector picks it up and the PR for that new version mirrors whatever image digests it references — including newly-rolled tags upstream has silently updated. Already-vendored chart versions remain pinned to their original digests and are **not** re-resolved (that's the point of digest pinning; our consumers are safe).
+- **Security alert path:** if the detector observes that an already-vendored chart version's upstream **chart-tarball digest** has changed (a SemVer violation or upstream tampering signal), it opens a tracking *issue* (not a PR — there is no new version to vendor) so a human can investigate. Image-digest drift inside an already-vendored chart version is expected (tags are mutable) and does not trigger an alert.
 - A chart that cannot be honestly vendored (template-hardcoded images, partially-templated registry, subchart deps) **fails loudly** with an error directing the operator to a specific fix — never silently produces a broken vendored chart.
 - One chart in a 10-chart daily batch fails scanning → the other 9 PRs still open.
 - Two new versions of the same chart on the same day open two PRs that can both be merged without a human-rebase step.
@@ -129,8 +130,10 @@ helm-mirroring/
 │   │   └── <chart>-<version>.yaml
 │   ├── scanners.yaml           # scan plugin registration
 │   ├── scans/
-│   │   ├── images/sha256-<digest>/*.json   # per-image, per-scanner output
-│   │   └── charts/<chart>-<version>/*.json # per-chart scanner output
+│   │   ├── images/sha256-<digest>/<chart>-<version>/*.json  # scoped by chart-version so two
+│   │   │                                                    # PRs touching the same digest don't
+│   │   │                                                    # clobber each other (and retention keeps each)
+│   │   └── charts/<chart>-<version>/*.json
 │   ├── sboms/
 │   │   └── sha256-<digest>.spdx.json
 │   └── upstream-keys/          # cosign public keys for keyed upstream verification
@@ -186,10 +189,15 @@ charts:
     # render with /dev/null" case handleable without forking the chart.
     discovery_values:
       installCRDs: true
-    # Escape hatch for images helm template won't surface
+    # manual_images pre-mirrors images the chart CAN reach but doesn't render
+    # by default (conditional features the operator knows will be enabled).
+    # It does NOT rewrite the chart or fix Goal #1 for template-hardcoded
+    # images — those hard-fail with no escape hatch.
     manual_images:
       - upstream: quay.io/jetstack/cert-manager-acmesolver:v1.14.5
-        values_path: null              # null = pin-and-mirror, no values rewrite
+        values_path: acmesolver.image   # MUST point at a real values path that
+                                        # reaches this image. A null values_path
+                                        # is rejected at validation time.
     # Chart-level scan policy REPLACES the default entirely (not a merge).
     # If you want to extend the default, redeclare its scanners explicitly.
     scan_policy: strict
@@ -199,7 +207,7 @@ Fields:
 - `source.type`: `classic` → `helm repo add` + `helm pull`; `oci` → `helm pull oci://…`.
 - `version_floor`: SemVer; pre-releases skipped unless floor is a pre-release.
 - `discovery_values`: optional minimal values overlay used *only* during image discovery. Charts that require inputs to render at all (license-accept booleans, required JSON-schema fields) need this to avoid failing discovery before it starts.
-- `manual_images`: images `helm template` won't surface (template-hardcoded, partially-templated registry, or conditional on non-default values). `values_path` may be `null` (mirror only, no rewrite).
+- `manual_images`: pre-mirror images the chart reaches via a values path but doesn't render by default (conditional features). Each entry **must** supply a `values_path` that a consumer would override to enable the feature; the discovery pass will use that path to confirm the image actually reaches the named values key. `manual_images` is **not** a fix for template-hardcoded images — those hard-fail with no escape (see "Classify rewrite scope" below). `values_path: null` is rejected at config validation.
 - `scan_policy`: named policy (definitions live in `manifest/scanners.yaml`). **Chart-level `scan_policy` replaces the default entirely — it is not merged.** If you want to add one scanner on top of the default, redeclare the full policy for that chart.
 
 ### Image discovery
@@ -224,15 +232,15 @@ Input: chart tarball at a pinned version. Output: `DiscoveredImage{ upstream_ref
    - For split form (`image.repository` + `image.tag` (+ optional `image.registry`) under the same parent), treat the triple as one logical ref; sentinel each field and record `values_path = <parent>.image`.
 7. **Classify rewrite scope (full / partial / none).** For each discovered ref, determine which components of the image reference — **registry host**, **repository path**, **tag**, and **digest** — actually move when the corresponding values are mutated.
    - **Full:** mutating the values path shifts the registry host, the repo path, *and* the tag (or the chart supports an explicit `image.digest` field we can set). Safe to rewrite. Proceed.
-   - **Partial:** mutating the values path shifts only some components — typically the classic case of `image: "registry.k8s.io/foo:{{ .Values.tag }}"` where the registry is hardcoded in the template. **Treat as none.** Do not attempt a rewrite. Fail the vendor run:
+   - **Partial:** mutating the values path shifts only some components — typically the classic case of `image: "registry.k8s.io/foo:{{ .Values.tag }}"` where the registry is hardcoded in the template. **Cannot be vendored honestly.** A rewrite would produce a broken `values.yaml` (our tag on upstream's registry); mirroring the image without a rewrite still leaves the default install reaching upstream — Goal #1 violated silently. Hard fail the vendor run:
      ```
      ERROR: chart foo 1.2.3 renders image 'registry.k8s.io/foo:v1.2.3' whose
-     values path '.tag' only controls tag, not registry. A rewrite would produce
-     a broken values.yaml (our tag, upstream registry). Pin this image via
-     charts.yaml manual_images with values_path: null.
+     values path '.tag' only controls tag, not registry. This chart cannot be
+     vendored without patching its templates (out of scope for v1). Remove
+     this chart from config/charts.yaml or wait for template-patching support.
      ```
-   - **None:** no values path affects the image. Template-hardcoded. Fail the vendor run with the existing error directing the operator to `manual_images`.
-   - **Ambiguous (tpl construction):** if mutating multiple independent values paths all affect the same rendered image (e.g. chart does `{{ tpl .Values.imageTemplate . }}`), the rewriter has no principled way to feed our mirror back through `tpl`. Fail as `partial`, same fix.
+   - **None:** no values path affects the image. Template-hardcoded. Same hard fail — `manual_images` does **not** close this gap because it only pre-mirrors the image; the chart template still references upstream at render time.
+   - **Ambiguous (tpl construction):** if mutating multiple independent values paths all affect the same rendered image (e.g. chart does `{{ tpl .Values.imageTemplate . }}`), the rewriter has no principled way to feed our mirror back through `tpl`. Hard fail, same error.
 8. Merge `manual_images` onto the discovered list before proceeding.
 
 **Why sentinel-diff, not static values.yaml parsing.** Values files use templating (`{{ .Values.global.imageRegistry }}`) and conditionals; static parsing gets the 80% case and lies about the rest. Rendering is ground truth. Cost is a few re-renders per chart — seconds, not minutes.
@@ -270,18 +278,18 @@ images:
     rewrite_scope: full                    # full | none (never partial — partial errors earlier)
     discovery_source: template             # template | manual
     upstream_signed: true
-    scan_refs:                             # filenames under manifest/scans/images/<digest>/
+    scan_refs:                             # under manifest/scans/images/sha256-<digest>/<chart>-<version>/
       - trivy.json
       - grype.json
       - cosign-verify.json
-    sbom_ref: manifest/sboms/sha256-4e3bc91a.spdx.json
+    sbom_ref: manifest/sboms/sha256-4e3bc91a/ingress-nginx-4.10.2.spdx.json
 scan_refs_chart:                           # filenames under manifest/scans/charts/<chart>-<version>/
   - kubelinter.json
   - helm-lint.json
 scan_verdict: pass                         # pass | fail | error  (aggregate across all scanners)
 ```
 
-The detector writes no `mirror_repo`, no `first_seen`, no `used_by` — those fields belong to vendor-time. It *does* write full scan result refs, so the PR contains complete review material.
+The detector writes no `mirror_repo`, no `first_seen`, no `used_by` — those fields belong to vendor-time. It **does** write full scan result refs, upstream signature verification, and SBOMs so the PR contains complete review material and the approver judges on facts, not promises.
 
 #### Canonical manifest (`manifest/mirror-manifest.yaml`)
 
@@ -295,7 +303,7 @@ images:
     upstream_ref: registry.k8s.io/ingress-nginx/controller:v1.10.1
     mirror_repo: 123456789012.dkr.ecr.us-east-1.amazonaws.com/mirror/images/ingress-nginx-controller
     mirror_tags:
-      - v1.10.1-mirror-20260423
+      - v1.10.1-mirror-20260423-4e3bc91a
     first_seen: 2026-04-23T14:02:11Z
     upstream_signed: true
     our_signed_at: 2026-04-23T14:06:00Z    # after cosign sign completes; see Idempotency
@@ -304,7 +312,8 @@ images:
         result: manifest/scans/images/sha256-4e3bc91a/trivy.json
         ran_at: 2026-04-23T14:05:00Z
         summary: { critical: 0, high: 2, medium: 7 }
-    sbom_path: manifest/sboms/sha256-4e3bc91a.spdx.json
+    sboms:
+      - manifest/sboms/sha256-4e3bc91a/ingress-nginx-4.10.2.spdx.json
     used_by:
       - { chart: ingress-nginx, chart_version: 4.10.1 }
       - { chart: ingress-nginx, chart_version: 4.10.2 }
@@ -334,10 +343,16 @@ Manual edits to `manifest/mirror-manifest.yaml` (human-driven GC, rollback, sche
 
 ### Digest pinning & mirror tagging
 
-Per image:
-- `skopeo copy --preserve-digests docker://<upstream> docker://<mirror_repo>@sha256:<digest>` pushes by digest.
-- `skopeo copy docker://<mirror_repo>@sha256:<digest> docker://<mirror_repo>:<upstream-tag>-mirror-<YYYYMMDD>` mints a dated mirror tag. The `-mirror-<date>` suffix is explicit that this is our copy.
-- We **do not** mirror the upstream tag verbatim (no `:v1.10.1`). Forces consumers off accidental tag-based trust.
+Push destinations are **tags**, not digests — registries compute digests from uploaded content; you pull *from* a digest but push *to* a tag. `skopeo copy --preserve-digests` guarantees the manifest bytes are copied byte-for-byte, so the resulting destination digest equals the source digest. We verify that equality post-push.
+
+Exact sequence per image:
+
+1. **Mint mirror tag.** `<upstream-tag>-mirror-<YYYYMMDD>-<short-digest>` where `<short-digest>` is the first 8 hex chars of the source digest. The short-digest prefix kills the same-day collision case (same upstream tag resolving to different digests within a single day — e.g. CDN flip, fast re-publication).
+2. **Push.** `skopeo copy --preserve-digests docker://<upstream>@sha256:<digest> docker://<mirror_repo>:<mirror_tag>`.
+3. **Verify.** `crane digest <mirror_repo>:<mirror_tag>` (or equivalent `registry.Exists`) returns the digest; assert it equals the source digest. Mismatch → abort, mark the pending file `status: error`, write no manifest entry.
+4. **Reference by digest** everywhere downstream (values.yaml, manifest, cosign). The mirror tag is a human-readable handle for logs; the digest is authoritative identity.
+
+We do **not** mirror the upstream tag verbatim (no bare `:v1.10.1`). Forces consumers off accidental tag-based trust.
 
 Chart push: `helm push <vendored-tarball> oci://<registry>/mirror/charts/` after values are rewritten.
 
@@ -359,7 +374,7 @@ controller:
   image:
     registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
     image: mirror/images/ingress-nginx-controller
-    tag: v1.10.1-mirror-20260423
+    tag: v1.10.1-mirror-20260423-4e3bc91a
     digest: sha256:4e3b...c91a   # always set by us
 ```
 
@@ -370,7 +385,7 @@ redis:
   image: docker.io/bitnami/redis:7.2.4
 # after
 redis:
-  image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/mirror/images/bitnami-redis:7.2.4-mirror-20260423@sha256:9a1f...02dd
+  image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/mirror/images/bitnami-redis:7.2.4-mirror-20260423-9a1f02dd@sha256:9a1f...02dd
 ```
 
 We append `@sha256:…` when the chart accepts it. If the chart strips digests in its template, the repo+tag rewrite is still authoritative (tag is ours, repo is ours); the manifest is the canonical digest.
@@ -548,29 +563,32 @@ exit 0
 
 ### Cosign / signature verification
 
-**At vendor-time (in order):**
+Anything that informs **human approval** must be known by detector-time so it appears in the PR. Vendor re-verifies for defense in depth but never discovers new facts.
 
-1. **Upstream image signatures.** `cosign verify <upstream-image>@<digest> --certificate-identity-regexp=… --certificate-oidc-issuer=…` when upstream uses keyless (Sigstore Fulcio). Keyed: verify against a public key committed under `manifest/upstream-keys/`.
-2. **Upstream chart provenance.** If `.prov` exists next to the tarball, `helm verify`. If upstream uses `cosign sign-blob` on the tarball, verify that instead.
-3. If neither signature type is present, record `upstream_signed: false` in the manifest entry. Approver sees this in the PR — judgment call, not auto-block.
+**At detector-time (results committed to the pending file + PR):**
 
-**After mirroring, re-sign with our own key** so consumers verify provenance from *our* registry:
+1. **Upstream image signatures.** `cosign verify <upstream-image>@<digest> --certificate-identity-regexp=… --certificate-oidc-issuer=…` when upstream uses keyless (Sigstore Fulcio). Keyed: verify against a public key committed under `manifest/upstream-keys/`. Result → `upstream_signed: true|false` per image in the pending file.
+2. **Upstream chart provenance.** If `.prov` exists next to the tarball, `helm verify`. If upstream uses `cosign sign-blob` on the tarball, verify that instead. Result → pending-file `upstream_signed` on the chart.
+3. No signatures present → `upstream_signed: false`. Approver sees this in the PR — judgment call, not auto-block.
 
-- Each mirrored image: `cosign sign <our-registry>/<image>@<digest>`.
-- Each mirrored chart: `cosign sign-blob` on the tarball; signature stored as an OCI artifact next to the chart.
-- SBOM attestation: `cosign attest --predicate sbom.spdx.json --type spdx`.
+**At vendor-time:**
 
-**Key storage: AWS KMS for prod**, via cosign KMS integration (`cosign sign --key awskms:///arn:…`). Private key never leaves KMS; GHA's OIDC role is allowed `kms:Sign`. For test/zot, a GHA-secret-stored cosign key is acceptable. **Do not** use a plain GHA secret for the prod key — it's extractable by any repo admin.
+1. **Re-verify** upstream signatures (defense against a merge-to-mirror race). Abort if verification now fails (`status: error` on the pending file).
+2. **Re-sign everything with our own key** so consumers verify provenance from *our* registry:
+   - Each mirrored image: `cosign sign <our-registry>/<image>@<digest>`.
+   - Each mirrored chart: `cosign sign-blob` on the tarball; signature stored as an OCI artifact next to the chart.
+   - Attach the SBOM: `cosign attest --predicate sbom.spdx.json --type spdx`.
+
+**Key storage: AWS KMS for prod**, via cosign KMS integration (`cosign sign --key awskms:///alias/helm-mirror-signer`). Private key never leaves KMS; GHA's OIDC role is allowed `kms:Sign`. For test/zot, a GHA-secret-stored cosign key is acceptable. **Do not** use a plain GHA secret for the prod key — it's extractable by any repo admin.
 
 ### SBOM
 
-**Generate at vendor-time with syft**, one per mirrored image. Format: SPDX JSON. Stored:
+**Generate at detector-time with syft** on the upstream image digest. The SBOM is committed into the PR so the approver has visibility.
 
-- As a cosign attestation on the image in the registry (`cosign attest`).
-- Also at `manifest/sboms/<digest>.spdx.json` for grep-ability and offline audit.
-- Referenced from the manifest image entry: `sbom_path: manifest/sboms/sha256-….spdx.json`.
+- Detector: `syft <upstream>@<digest> -o spdx-json > manifest/sboms/sha256-<digest>/<chart>-<version>.spdx.json`. Pending file references it via `sbom_ref`.
+- Vendor: re-generates on the *mirrored* digest to confirm byte-equivalence (they should match — `skopeo --preserve-digests`), then attaches to our-registry image as a cosign attestation (`cosign attest`).
 
-We regenerate rather than pass through upstream SBOMs — consistent format, proves the SBOM matches the bytes we actually mirrored.
+Format: SPDX JSON. We regenerate rather than pass through upstream SBOMs — consistent format, proves the SBOM matches the bytes we mirrored.
 
 ### Scan result storage & PR surfacing
 
@@ -579,17 +597,21 @@ We regenerate rather than pass through upstream SBOMs — consistent format, pro
 manifest/
 ├── scans/
 │   ├── images/
-│   │   └── sha256-abc123.../       # image digest (dash-encoded, filesystem-safe)
-│   │       ├── trivy.json
-│   │       ├── grype.json
-│   │       └── cosign-verify.json
+│   │   └── sha256-abc123.../                 # image digest (dash-encoded)
+│   │       └── my-chart-1.2.3/               # chart-version that triggered this scan run
+│   │           ├── trivy.json
+│   │           ├── grype.json
+│   │           └── cosign-verify.json
 │   └── charts/
 │       └── my-chart-1.2.3/
 │           ├── kubelinter.json
 │           └── helm-lint.json
 └── sboms/
-    └── sha256-abc123....spdx.json
+    └── sha256-abc123.../
+        └── my-chart-1.2.3.spdx.json          # SBOM path scoped same way
 ```
+
+**Why per-chart-version scan paths under the digest directory.** Two PRs for different chart versions that both reference the same image digest would otherwise touch the same `trivy.json` file — reintroducing the merge-conflict hot spot we killed by splitting the manifest. Scoping scan output by `{digest, chart, chart-version}` keeps each PR's outputs disjoint *and* preserves the full historical record (a re-scan of the same digest from a different chart-version lands in its own path).
 
 The per-chart PR commits relevant scan JSONs under `manifest/scans/…` — reviewable in the diff, greppable forever.
 
@@ -630,7 +652,9 @@ All non-trivial logic lives in `internal/` so it's testable without a runner. Wo
 
 **Topology:** a coordinator `plan` job reads `config/charts.yaml` and emits a JSON matrix of `{chart, candidate_version}` pairs; a `per-chart` job fans out, runs scans inline, writes a `manifest/pending/<chart>-<version>.yaml` file plus scan JSONs, opens a PR, and posts a sticky scan-summary comment from the same job.
 
-**Critical: PR author identity.** The detector creates PRs using a **GitHub App token**, not the default `GITHUB_TOKEN`. Reason: PRs opened with the default `GITHUB_TOKEN` do not trigger required-status workflows, which would leave the red "scans failed" check missing from the PR and let a reviewer merge unreviewed-by-CI. A GitHub App install (`HELM_MIRROR_BOT_APP_ID` + private key in secrets) provides a token that both opens the PR and triggers its required checks. (The status checks themselves run inline in this same `detect.yml` job — see below. The App token is still necessary for the PR-author identity and for any future `pull_request`-triggered workflows we add.)
+**Critical: required check against the PR head SHA.** The detector runs on `main`; the job that ran the scans completes against `main`'s SHA, **not** the PR's head SHA. Branch protection required-checks match the PR head SHA, so a job-level success/failure on `detect.yml`'s `main` run is invisible to branch protection. The fix: after pushing the PR branch, the detector **explicitly posts a Checks API result** against the PR head SHA (`POST /repos/:owner/:repo/check-runs`) with the scan verdict as `conclusion: success|failure|neutral`. Branch protection is configured to require a check named `mirror/scan` on PRs touching `manifest/pending/**`. This makes "red scan = can't merge" a real guarantee, not a hope.
+
+**PR author identity.** The detector creates PRs using a **GitHub App token**, not the default `GITHUB_TOKEN`. Reason: PRs opened with the default `GITHUB_TOKEN` do not trigger `pull_request`-triggered workflows at all. The App token (`HELM_MIRROR_BOT_APP_ID` + private key in secrets) is also the credential that posts the Checks API status above.
 
 ```yaml
 name: detect
@@ -687,15 +711,21 @@ jobs:
       # Pull candidate chart + run image discovery (may fail-loud on partial-rewrite etc.)
       - run: mirrorctl detect pull --chart "${{ matrix.chart }}" --version "${{ matrix.version }}"
 
-      # Scanning runs inline. Writes pending file and scan JSONs to disk.
-      # Exit code is 0 even when scans fail — the verdict is in the output.
+      # Scanning runs inline. Also runs cosign-verify against upstream and
+      # syft against each upstream image digest so the PR carries all the
+      # facts the approver needs (vendor-time re-verifies but never discovers
+      # new facts — see Security & Scanning → Cosign / signature verification).
+      # Exit code 0 even when scans fail — verdict is in the pending file.
       - id: scan
         run: |
           mirrorctl scan run \
             --chart "${{ matrix.chart }}" \
             --version "${{ matrix.version }}" \
             --write-pending manifest/pending/${{ matrix.chart }}-${{ matrix.version }}.yaml \
-            --write-scans manifest/scans/
+            --write-scans manifest/scans/ \
+            --write-sboms manifest/sboms/ \
+            --include-cosign-verify \
+            --include-sbom
           echo "verdict=$(yq .scan_verdict manifest/pending/${{ matrix.chart }}-${{ matrix.version }}.yaml)" >> "$GITHUB_OUTPUT"
 
       # Open (or update) the PR. Always open — even on scan fail.
@@ -723,8 +753,25 @@ jobs:
           number: ${{ steps.pr.outputs.pull-request-number }}
           path: .scan-summary.md
 
-      # GitHub check: red when scans failed. Required branch-protection check.
-      # Fails the *job step*, not the whole matrix — other charts keep going.
+      # Post a Checks API result against the PR HEAD SHA so branch protection
+      # can enforce it. detect.yml runs on main; branch protection looks at
+      # checks on the PR head SHA, so the job status alone is invisible to it.
+      - if: steps.pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.pull-request-head-sha }}
+          VERDICT: ${{ steps.scan.outputs.verdict }}
+        run: |
+          conclusion=$([ "$VERDICT" = "fail" ] && echo failure || echo success)
+          gh api repos/${{ github.repository }}/check-runs \
+            -f name="mirror/scan" \
+            -f head_sha="$HEAD_SHA" \
+            -f status=completed \
+            -f conclusion="$conclusion" \
+            -f "output[title]=scan verdict: $VERDICT" \
+            -f "output[summary]=$(cat .scan-summary.md | head -c 60000)"
+
+      # Also fail the job step so the detector matrix's own status is honest.
       - if: steps.scan.outputs.verdict == 'fail'
         run: |
           echo "::error::scan verdict=fail for ${{ matrix.chart }} ${{ matrix.version }}"
