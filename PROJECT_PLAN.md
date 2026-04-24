@@ -654,12 +654,58 @@ All non-trivial logic lives in `internal/` so it's testable without a runner. Wo
 
 **Critical: required check against the PR head SHA.** The detector runs on `main`; the job that ran the scans completes against `main`'s SHA, **not** the PR's head SHA. Branch protection required-checks match the PR head SHA, so a job-level success/failure on `detect.yml`'s `main` run is invisible to branch protection. The fix: after pushing the PR branch, the detector **explicitly posts a Checks API result** against the PR head SHA (`POST /repos/:owner/:repo/check-runs`) with the scan verdict as `conclusion: success|failure|neutral`. The `checks: write` permission on the bot App is required for this.
 
-**Enforcing the required check.** Classic GitHub branch protection is **not path-scoped** — you can't say "require `mirror/scan` only on PRs touching `manifest/pending/**`." Two viable options:
+**Enforcing the required check.** Neither classic branch protection nor current GitHub rulesets support **path-scoped required status checks**. (Rulesets' ref conditions are branch/tag-name scoped; path rules in rulesets are *push restrictions*, not conditions for applying a required check. See [GitHub rulesets docs](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets).) The v1 design therefore uses a **globally-required check + noop emitter** pattern:
 
-1. **Repo rulesets (recommended)** — GitHub's newer ruleset system supports path-scoped required checks. Create a ruleset targeting `main` with a condition on `manifest/pending/**` paths, required status check `mirror/scan`. This is the clean answer.
-2. **Fallback for repos on classic branch protection only** — make `mirror/scan` globally required on all PRs to `main`. Non-mirror PRs need a trivial emitter (a tiny `.github/workflows/scan-check-noop.yml` that posts `mirror/scan` with `conclusion: neutral` on any PR that doesn't touch `manifest/pending/**`), otherwise classic BP blocks merge on missing-required-check.
+1. **Make `mirror/scan` globally required** on PRs to `main` (via classic branch protection or a ruleset — either works because the requirement is global).
+2. **Mirror PRs** get their real `mirror/scan` result from `detect.yml` (see the Checks API step above).
+3. **Non-mirror PRs** get a neutral `mirror/scan` from a trivial **noop emitter** workflow, so branch protection doesn't block them for a missing required check:
 
-We document both; repos with rulesets available use option 1.
+   ```yaml
+   # .github/workflows/scan-check-noop.yml
+   name: scan-check-noop
+   on:
+     pull_request:
+       branches: [main]
+   permissions:
+     contents: read
+     checks: write
+   jobs:
+     gate:
+       runs-on: ubuntu-latest
+       outputs:
+         is_mirror_pr: ${{ steps.check.outputs.is_mirror_pr }}
+       steps:
+         - uses: actions/checkout@v4
+           with: { fetch-depth: 0 }
+         - id: check
+           run: |
+             base=${{ github.event.pull_request.base.sha }}
+             head=${{ github.event.pull_request.head.sha }}
+             if git diff --name-only "$base" "$head" | grep -q '^manifest/pending/'; then
+               echo "is_mirror_pr=true"  >> "$GITHUB_OUTPUT"
+             else
+               echo "is_mirror_pr=false" >> "$GITHUB_OUTPUT"
+             fi
+     emit-neutral:
+       needs: gate
+       if: needs.gate.outputs.is_mirror_pr == 'false'
+       runs-on: ubuntu-latest
+       steps:
+         - env:
+             GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+           run: |
+             gh api repos/${{ github.repository }}/check-runs \
+               -f name="mirror/scan" \
+               -f head_sha="${{ github.event.pull_request.head.sha }}" \
+               -f status=completed \
+               -f conclusion=neutral \
+               -f "output[title]=not a mirror PR" \
+               -f "output[summary]=PR does not touch manifest/pending/**; scan gate N/A."
+   ```
+
+   Why an explicit diff check instead of `paths-ignore: 'manifest/pending/**'` on the workflow trigger: `paths-ignore` skips the workflow only when **all** changed files match the ignore list. A PR that touches both `manifest/pending/foo.yaml` and `README.md` would otherwise still run the noop (not all paths are ignored) and post a neutral `mirror/scan`, *overriding* detect's authoritative result. The explicit `git diff`-based gate handles mixed-paths PRs correctly: any touch of `manifest/pending/**` → `mirror/scan` is owned by `detect.yml`, noop is skipped.
+
+If GitHub later ships path-scoped required checks as a first-class feature, this design gracefully deprecates the noop emitter.
 
 **PR author identity.** The detector creates PRs using a **GitHub App token**, not the default `GITHUB_TOKEN`. Reason: PRs opened with the default `GITHUB_TOKEN` do not trigger `pull_request`-triggered workflows at all. The App token (`HELM_MIRROR_BOT_APP_ID` + private key in secrets) is also the credential that posts the Checks API status above.
 
