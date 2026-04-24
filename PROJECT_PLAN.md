@@ -135,7 +135,7 @@ helm-mirroring/
 │   │   │                                                    # clobber each other (and retention keeps each)
 │   │   └── charts/<chart>-<version>/*.json
 │   ├── sboms/
-│   │   └── sha256-<digest>.spdx.json
+│       └── sha256-<digest>/<chart>-<version>.spdx.json
 │   └── upstream-keys/          # cosign public keys for keyed upstream verification
 ├── scanners/                   # bundled scan plugin executables
 ├── vendored/<chart>/<version>/ # rewritten chart tarball + values.yaml
@@ -309,7 +309,7 @@ images:
     our_signed_at: 2026-04-23T14:06:00Z    # after cosign sign completes; see Idempotency
     scan:
       trivy:
-        result: manifest/scans/images/sha256-4e3bc91a/trivy.json
+        result: manifest/scans/images/sha256-4e3bc91a/ingress-nginx-4.10.2/trivy.json
         ran_at: 2026-04-23T14:05:00Z
         summary: { critical: 0, high: 2, medium: 7 }
     sboms:
@@ -466,7 +466,7 @@ A scan plugin is an **executable** (any language) that reads a job spec on stdin
 {
   "kind": "image" | "chart",
   "target": "ghcr.io/foo/bar@sha256:abc..." | "/tmp/charts/foo-1.2.3.tgz",
-  "output_path": "manifest/scans/images/sha256-abc.../<scanner>.json",
+  "output_path": "manifest/scans/images/sha256-abc.../<chart>-<version>/<scanner>.json",
   "config": { "severity_threshold": "HIGH" },
   "timeout_seconds": 600
 }
@@ -652,7 +652,14 @@ All non-trivial logic lives in `internal/` so it's testable without a runner. Wo
 
 **Topology:** a coordinator `plan` job reads `config/charts.yaml` and emits a JSON matrix of `{chart, candidate_version}` pairs; a `per-chart` job fans out, runs scans inline, writes a `manifest/pending/<chart>-<version>.yaml` file plus scan JSONs, opens a PR, and posts a sticky scan-summary comment from the same job.
 
-**Critical: required check against the PR head SHA.** The detector runs on `main`; the job that ran the scans completes against `main`'s SHA, **not** the PR's head SHA. Branch protection required-checks match the PR head SHA, so a job-level success/failure on `detect.yml`'s `main` run is invisible to branch protection. The fix: after pushing the PR branch, the detector **explicitly posts a Checks API result** against the PR head SHA (`POST /repos/:owner/:repo/check-runs`) with the scan verdict as `conclusion: success|failure|neutral`. Branch protection is configured to require a check named `mirror/scan` on PRs touching `manifest/pending/**`. This makes "red scan = can't merge" a real guarantee, not a hope.
+**Critical: required check against the PR head SHA.** The detector runs on `main`; the job that ran the scans completes against `main`'s SHA, **not** the PR's head SHA. Branch protection required-checks match the PR head SHA, so a job-level success/failure on `detect.yml`'s `main` run is invisible to branch protection. The fix: after pushing the PR branch, the detector **explicitly posts a Checks API result** against the PR head SHA (`POST /repos/:owner/:repo/check-runs`) with the scan verdict as `conclusion: success|failure|neutral`. The `checks: write` permission on the bot App is required for this.
+
+**Enforcing the required check.** Classic GitHub branch protection is **not path-scoped** — you can't say "require `mirror/scan` only on PRs touching `manifest/pending/**`." Two viable options:
+
+1. **Repo rulesets (recommended)** — GitHub's newer ruleset system supports path-scoped required checks. Create a ruleset targeting `main` with a condition on `manifest/pending/**` paths, required status check `mirror/scan`. This is the clean answer.
+2. **Fallback for repos on classic branch protection only** — make `mirror/scan` globally required on all PRs to `main`. Non-mirror PRs need a trivial emitter (a tiny `.github/workflows/scan-check-noop.yml` that posts `mirror/scan` with `conclusion: neutral` on any PR that doesn't touch `manifest/pending/**`), otherwise classic BP blocks merge on missing-required-check.
+
+We document both; repos with rulesets available use option 1.
 
 **PR author identity.** The detector creates PRs using a **GitHub App token**, not the default `GITHUB_TOKEN`. Reason: PRs opened with the default `GITHUB_TOKEN` do not trigger `pull_request`-triggered workflows at all. The App token (`HELM_MIRROR_BOT_APP_ID` + private key in secrets) is also the credential that posts the Checks API status above.
 
@@ -835,6 +842,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0, ref: main }   # start on the push-event SHA
+
+      # CRITICAL: after acquiring the concurrency slot, a queued vendor run
+      # may have started from a stale push SHA (the earlier run already
+      # consumed and deleted pending files and updated the manifest).
+      # Reset to current origin/main BEFORE planning so we never reprocess
+      # a pending file that has already been vendored.
+      - name: Reset to current origin/main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          git log -1 --oneline
+
+      # Re-plan against current state — the plan job's matrix may now be
+      # partially stale. Planning here AS WELL gives us the authoritative
+      # per-run filter; a matrix entry whose pending file no longer exists
+      # is skipped with an early exit.
+      - name: Re-check pending file still exists
+        run: |
+          if [ ! -f "manifest/pending/${{ matrix.chart }}-${{ matrix.version }}.yaml" ]; then
+            echo "::notice::pending file already consumed by an earlier run; skipping"
+            exit 0
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.ECR_VENDOR_ROLE_ARN }}
@@ -875,7 +906,11 @@ jobs:
 
 ### Idempotency
 
-- **Detector planner** consults `manifest/mirror-manifest.yaml` and existing files in `manifest/pending/`. If `{chart, version}` is already vendored, skip. If a pending file already exists for that version (open PR in flight), skip. If PR branch already exists, `create-pull-request` updates rather than duplicates.
+- **Detector planner** consults `manifest/mirror-manifest.yaml` and existing files in `manifest/pending/`.
+  - If `{chart, version}` is already vendored **and** the upstream chart-tarball digest matches the recorded `upstream_chart_digest`: skip this version entirely. (Cheap check: a `HEAD` / index.yaml fetch; no pull, no render.)
+  - If `{chart, version}` is already vendored **but** the upstream chart-tarball digest has changed: this is a SemVer violation or tampering signal (see "Security alert path" in Success criteria). Emit a tracking issue with `bot: helm-mirror` label and skip vendoring — there is no new version to mirror. Do NOT re-vendor.
+  - If a pending file already exists for that version (open PR in flight): skip.
+  - If the PR branch already exists: `create-pull-request` updates rather than duplicates.
 - **Vendor planner** finds every file in `manifest/pending/` on the tip of main; produces one matrix entry per file.
 - **Mirror push** uses `skopeo copy --preserve-digests` with digest-pinned source. Repeated pushes are no-ops at the registry.
 
@@ -884,7 +919,7 @@ Lose `vendored/`? Re-run vendor — rebuilds from the canonical manifest. Lose t
 ### Auth
 
 - **AWS / ECR:** OIDC. One IAM role (`ECR_VENDOR_ROLE_ARN`) trusted by `repo:org/helm-mirroring:ref:refs/heads/main` with: `ecr:GetAuthorizationToken` (required by `amazon-ecr-login`), `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:CreateRepository`, `ecr:DescribeRepositories`, `kms:Sign` on the signing key alias. A read-only role (`ecr:DescribeImages`, `ecr:ListImages`, `ecr:GetAuthorizationToken`) is available to the detector for tag lookups but is not required in v1. Audience `sts.amazonaws.com`. Trust policy owned by the platform team; we document what's required.
-- **GitHub — bot identity:** a GitHub App (`HELM_MIRROR_BOT_APP_ID`) installed on the repo. The detector uses this App token to open PRs (App-authored PRs fire required checks; `GITHUB_TOKEN`-authored PRs don't). The App needs `pull_requests: write`, `contents: write`, and read on `metadata`. Private key stored in secret `HELM_MIRROR_BOT_PRIVATE_KEY`.
+- **GitHub — bot identity:** a GitHub App (`HELM_MIRROR_BOT_APP_ID`) installed on the repo. The detector uses this App token to open PRs (App-authored PRs fire `pull_request` workflows; `GITHUB_TOKEN`-authored PRs don't) and to post Checks API results. The App needs: `pull_requests: write`, `contents: write`, `checks: write` (required to create check-runs via the Checks API), `issues: write` (for the security-alert tracking issues on chart-tarball re-publication), and read on `metadata`. Private key stored in secret `HELM_MIRROR_BOT_PRIVATE_KEY`.
 - **GitHub — vendor commit-back:** default `GITHUB_TOKEN` with `contents: write`. Chosen specifically because its pushes don't re-fire workflows — our sole loop guard on `vendor.yml`.
 - **Cosign signing key:** AWS KMS (prod), referenced by alias. cosign's KMS integration. Same OIDC role assumes `kms:Sign`.
 
@@ -951,7 +986,7 @@ PRs open on schedule. No scanning yet. No ECR yet.
 - Per-chart isolation: subprocess + timeout + exit-code capture.
 - Scan results as sticky PR comment + job summary tables.
 - Failure policy implemented: red check on fail blocks merge via branch protection; PR always opens.
-- Scan results written to `manifest/scans/images/sha256-<digest>/<scanner>.json` and `manifest/scans/charts/<chart>-<version>/<scanner>.json`.
+- Scan results written to `manifest/scans/images/sha256-<digest>/<chart>-<version>/<scanner>.json` and `manifest/scans/charts/<chart>-<version>/<scanner>.json`; SBOMs at `manifest/sboms/sha256-<digest>/<chart>-<version>.spdx.json`.
 
 **Exit:** a fixture chart with a deliberately vulnerable image produces a failing PR check; a clean fixture produces passing.
 
