@@ -855,35 +855,45 @@ jobs:
           git reset --hard origin/main
           git log -1 --oneline
 
-      # Re-plan against current state — the plan job's matrix may now be
-      # partially stale. Planning here AS WELL gives us the authoritative
-      # per-run filter; a matrix entry whose pending file no longer exists
-      # is skipped with an early exit.
+      # Re-check against current state. A queued vendor run's matrix may
+      # include a pending file that an earlier run already consumed and
+      # deleted. We detect that here and skip ALL subsequent steps via
+      # `if: steps.pending.outputs.exists == 'true'` — note that a plain
+      # `exit 0` in a step only succeeds the step; the job continues.
       - name: Re-check pending file still exists
+        id: pending
         run: |
-          if [ ! -f "manifest/pending/${{ matrix.chart }}-${{ matrix.version }}.yaml" ]; then
-            echo "::notice::pending file already consumed by an earlier run; skipping"
-            exit 0
+          if [ -f "manifest/pending/${{ matrix.chart }}-${{ matrix.version }}.yaml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::pending file already consumed by an earlier run; skipping remaining steps"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - if: steps.pending.outputs.exists == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.ECR_VENDOR_ROLE_ARN }}
           aws-region: us-east-1
-      - uses: aws-actions/amazon-ecr-login@v2
-      - uses: actions/setup-go@v5
+      - if: steps.pending.outputs.exists == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+      - if: steps.pending.outputs.exists == 'true'
+        uses: actions/setup-go@v5
         with: { go-version: '1.22' }
-      - run: |
+      - if: steps.pending.outputs.exists == 'true'
+        run: |
           mirrorctl vendor run \
             --pending manifest/pending/${{ matrix.chart }}-${{ matrix.version }}.yaml \
             --registry "${{ vars.MIRROR_REGISTRY }}"
+
       # Commit-back uses the default GITHUB_TOKEN on purpose: pushes made with
       # GITHUB_TOKEN do NOT fire further workflow runs, which is the sole
       # mechanism that prevents vendor.yml from re-triggering itself when it
       # writes to manifest/mirror-manifest.yaml. Do NOT swap this for a PAT or
       # App token without adding an alternative loop guard (e.g. a path filter
       # that excludes manifest/mirror-manifest.yaml).
-      - env: { GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+      - if: steps.pending.outputs.exists == 'true'
+        env: { GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
           git config user.name  "helm-mirror-bot"
           git config user.email "helm-mirror-bot@users.noreply.github.com"
